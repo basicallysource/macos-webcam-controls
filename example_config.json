@@ -1,0 +1,31 @@
+{
+  "cameras": [
+    {
+      "index": 0,
+      "settings": {
+        "exposure_time": 65,
+        "gain": 0,
+        "white_balance": 4600
+      }
+    },
+    {
+      "name_contains": "Arducam",
+      "bus": 0,
+      "addr": 9,
+      "settings": {
+        "exposure_mode": 1,
+        "exposure_time": 65
+      }
+    },
+    {
+      "vid": 3141,
+      "pid": 25446,
+      "settings": {
+        "brightness": 0,
+        "contrast": 28,
+        "saturation": 64,
+        "sharpness": 3
+      }
+    }
+  ]
+}

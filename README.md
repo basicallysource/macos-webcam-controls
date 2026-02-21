@@ -17,6 +17,29 @@ uv run python camera_keyboard_ui.py --list
 uv run python camera_keyboard_ui.py 1
 ```
 
+## Apply Settings From JSON
+
+Use `set.py` to apply settings without opening the UI.
+
+```bash
+uv run python set.py config.json --dry-run
+uv run python set.py config.json
+uv run python set.py config.json --verbose --force-manual
+```
+
+You can copy `example_config.json` as a starting point:
+
+```bash
+cp example_config.json config.json
+```
+
+Config structure:
+
+- `cameras`: list of rules
+- each rule has:
+  - matcher fields (any combination): `index`, `name`, `name_contains`, `bus`, `addr`, `vid`, `pid`
+  - `settings`: object of control IDs to values
+
 ## `uvc_camera.py` API
 
 ### Top-level functions
