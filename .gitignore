@@ -1,0 +1,6 @@
+.DS_Store
+captures
+config.json
+profile.log
+__pycache__
+CameraController/

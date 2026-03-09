@@ -4,16 +4,67 @@ import select
 import shutil
 import sys
 import termios
+import time
 import tty
 
+from camera_preview import PreviewWindow, find_cv2_indices
 from uvc_camera import UvcCameraController, UvcControllerError, formatCamera, listCameras, unrefCamera
 
-try:
-    import cv2
-except ImportError:
-    cv2 = None
+PROFILE_LOG = "profile.log"
 
-PREVIEW_WINDOW_NAME = "Camera Preview"
+
+class Profiler:
+    def __init__(self):
+        self._timers = {}
+        self._stats = {}
+        self._loop_start = None
+        self._loop_count = 0
+        self._log_file = open(PROFILE_LOG, "w")
+
+    def close(self):
+        self._writeSummary()
+        self._log_file.close()
+
+    def loopStart(self):
+        self._loop_start = time.perf_counter()
+        self._loop_count += 1
+
+    def loopEnd(self):
+        if self._loop_start is not None:
+            elapsed = time.perf_counter() - self._loop_start
+            self._record("loop_total", elapsed)
+            if elapsed > 0.1:
+                self._log(f"SLOW loop #{self._loop_count}: {elapsed*1000:.1f}ms")
+
+    def start(self, name):
+        self._timers[name] = time.perf_counter()
+
+    def stop(self, name):
+        if name in self._timers:
+            elapsed = time.perf_counter() - self._timers.pop(name)
+            self._record(name, elapsed)
+
+    def _record(self, name, elapsed):
+        if name not in self._stats:
+            self._stats[name] = {"count": 0, "total": 0.0, "max": 0.0}
+        s = self._stats[name]
+        s["count"] += 1
+        s["total"] += elapsed
+        s["max"] = max(s["max"], elapsed)
+
+    def _log(self, msg):
+        self._log_file.write(f"[{time.perf_counter():.3f}] {msg}\n")
+        self._log_file.flush()
+
+    def _writeSummary(self):
+        self._log_file.write("\n=== PROFILE SUMMARY ===\n")
+        self._log_file.write(f"{'name':<30} {'calls':>8} {'total':>10} {'avg':>10} {'max':>10}\n")
+        for name, s in sorted(self._stats.items()):
+            avg = s["total"] / s["count"] if s["count"] else 0
+            self._log_file.write(
+                f"{name:<30} {s['count']:>8} {s['total']*1000:>9.1f}ms {avg*1000:>9.2f}ms {s['max']*1000:>9.2f}ms\n"
+            )
+        self._log_file.write(f"\ntotal loops: {self._loop_count}\n")
 
 
 def parseArgs():
@@ -130,9 +181,9 @@ def renderControls(controller, control_ids, selected_idx, step_scales, pair_axis
         control_infos.append((control_id, spec, info, value))
 
     clearScreen()
-    print("UVC keyboard control")
+    print(f"UVC keyboard control — {controller.camera_descriptor.display_name}")
     print("keys: up/down (or k/j, w/s) select, left/right adjust")
-    print("keys: [ / ] step down/up, a axis for pan/tilt, v type value, r refresh, b cameras, q quit")
+    print("keys: [ / ] step down/up, a axis for pan/tilt, v type value, c capture, r refresh, b cameras, q quit")
     if preview_status:
         print(f"preview: {preview_status}")
     if status_line:
@@ -163,58 +214,6 @@ def renderControls(controller, control_ids, selected_idx, step_scales, pair_axis
         print("enter apply | esc cancel | backspace edit")
 
     sys.stdout.flush()
-
-
-class PreviewWindow:
-    def __init__(self, camera_index):
-        self._camera_index = camera_index
-        self._capture = None
-        self._status = "off"
-        self._failed = False
-
-    @property
-    def status(self):
-        return self._status
-
-    def start(self):
-        if cv2 is None:
-            self._status = "opencv not installed"
-            return
-
-        capture = cv2.VideoCapture(self._camera_index, cv2.CAP_AVFOUNDATION)
-        if not capture.isOpened():
-            capture.release()
-            capture = cv2.VideoCapture(self._camera_index)
-            if not capture.isOpened():
-                capture.release()
-                self._status = "failed to open"
-                return
-
-        self._capture = capture
-        self._status = "running"
-
-    def stop(self):
-        if self._capture is not None:
-            self._capture.release()
-            self._capture = None
-        if cv2 is not None:
-            try:
-                cv2.destroyWindow(PREVIEW_WINDOW_NAME)
-                cv2.waitKey(1)
-            except cv2.error:
-                pass
-
-    def update(self):
-        if self._capture is None or cv2 is None or self._failed:
-            return
-        try:
-            ok, frame = self._capture.read()
-            if ok:
-                cv2.imshow(PREVIEW_WINDOW_NAME, frame)
-            cv2.waitKey(1)
-        except cv2.error:
-            self._failed = True
-            self._status = "opencv display failed"
 
 
 class CbreakKeyboard:
@@ -391,7 +390,7 @@ def pickCamera(cameras):
                 return selected_idx
 
 
-def runLoop(controller, camera_index):
+def runLoop(controller, cv2_index):
     controller.forceManualMode()
 
     control_ids = controller.getSupportedControlIds()
@@ -404,21 +403,33 @@ def runLoop(controller, camera_index):
     value_input = None
     status_line = ""
 
-    preview = PreviewWindow(camera_index)
-    preview.start()
+    preview = PreviewWindow(controller.camera_descriptor)
+    preview.start(cv2_index)
+    profiler = Profiler()
 
     try:
         with CbreakKeyboard() as keyboard:
             renderControls(controller, control_ids, selected_idx, step_scales, pair_axis_map, value_input, preview.status, status_line)
 
             while True:
+                profiler.loopStart()
+
+                profiler.start("preview.update")
                 preview.update()
+                profiler.stop("preview.update")
+
+                profiler.start("keyboard.readEvent")
                 event = keyboard.readEvent(0.02)
+                profiler.stop("keyboard.readEvent")
+
                 if event is None:
+                    profiler.loopEnd()
                     continue
 
+                profiler.start("getControlInfo")
                 control_id = control_ids[selected_idx]
                 info = controller.getControlInfo(control_id)
+                profiler.stop("getControlInfo")
                 status_line = ""
 
                 if value_input is not None:
@@ -438,7 +449,10 @@ def runLoop(controller, camera_index):
                     elif isinstance(event, str) and len(event) == 1 and event in "0123456789,-_abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ":
                         value_input += event
 
+                    profiler.start("renderControls")
                     renderControls(controller, control_ids, selected_idx, step_scales, pair_axis_map, value_input, preview.status, status_line)
+                    profiler.stop("renderControls")
+                    profiler.loopEnd()
                     continue
 
                 if event == "q":
@@ -466,6 +480,8 @@ def runLoop(controller, camera_index):
                 elif event == "a":
                     if info.kind == "pair":
                         pair_axis_map[control_id] = 1 - pair_axis_map[control_id]
+                elif event == "c":
+                    status_line = preview.saveCapture()
                 elif event == "v":
                     value_input = ""
                 elif event == "r":
@@ -473,11 +489,33 @@ def runLoop(controller, camera_index):
                 else:
                     continue
 
+                profiler.start("renderControls")
                 renderControls(controller, control_ids, selected_idx, step_scales, pair_axis_map, value_input, preview.status, status_line)
+                profiler.stop("renderControls")
+
+                profiler.loopEnd()
     finally:
+        profiler.close()
         preview.stop()
 
     return "quit"
+
+
+def probeCv2Mapping(cameras):
+    """Probe all cameras at once to find their cv2 indices. See camera_preview.py."""
+    controllers = []
+    try:
+        for cam in cameras:
+            ctrl = UvcCameraController(cam)
+            ctrl.open()
+            controllers.append((cam, ctrl))
+        print("detecting preview cameras...")
+        mapping = find_cv2_indices(controllers)
+    finally:
+        for _, ctrl in controllers:
+            ctrl.close()
+    # Convert from id(descriptor) -> cv2_index to list_index -> cv2_index
+    return {i: mapping[id(cam)] for i, cam in enumerate(cameras) if id(cam) in mapping}
 
 
 def main():
@@ -491,6 +529,8 @@ def main():
         if not cameras:
             print("No UVC webcams found")
             return 1
+
+        cv2_mapping = probeCv2Mapping(cameras)
 
         selected_camera_index = args.camera_index
         while True:
@@ -506,8 +546,9 @@ def main():
             camera = cameras[selected_camera_index]
             print(f"selected {formatCamera(camera, selected_camera_index)}")
 
+            cv2_index = cv2_mapping.get(selected_camera_index)
             with UvcCameraController(camera) as controller:
-                result = runLoop(controller, selected_camera_index)
+                result = runLoop(controller, cv2_index)
 
             if result == "back":
                 selected_camera_index = None
