@@ -1,6 +1,7 @@
 .DS_Store
+.env
 captures
 config.json
-profile.log
+logs/
 __pycache__
 CameraController/

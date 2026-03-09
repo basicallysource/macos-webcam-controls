@@ -1,5 +1,6 @@
 import argparse
 import os
+from datetime import datetime
 import select
 import shutil
 import sys
@@ -7,10 +8,13 @@ import termios
 import time
 import tty
 
+from dotenv import load_dotenv
+load_dotenv()
+
 from camera_preview import PreviewWindow, find_cv2_indices
 from uvc_camera import UvcCameraController, UvcControllerError, formatCamera, listCameras, unrefCamera
 
-PROFILE_LOG = "profile.log"
+PROFILE_LOG_DIR = os.path.join(os.getcwd(), "logs", "profiling")
 
 
 class Profiler:
@@ -19,7 +23,10 @@ class Profiler:
         self._stats = {}
         self._loop_start = None
         self._loop_count = 0
-        self._log_file = open(PROFILE_LOG, "w")
+        os.makedirs(PROFILE_LOG_DIR, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_path = os.path.join(PROFILE_LOG_DIR, f"run_{timestamp}.log")
+        self._log_file = open(log_path, "w")
 
     def close(self):
         self._writeSummary()
@@ -172,14 +179,7 @@ def visibleWindow(selected_idx, total_items, max_visible):
     return start, end
 
 
-def renderControls(controller, control_ids, selected_idx, step_scales, pair_axis_map, value_input, preview_status, status_line):
-    control_infos = []
-    for control_id in control_ids:
-        spec = controller.getControlSpec(control_id)
-        info = controller.getControlInfo(control_id)
-        value = controller.getControl(control_id)
-        control_infos.append((control_id, spec, info, value))
-
+def renderControls(controller, control_ids, selected_idx, step_scales, pair_axis_map, value_input, preview_status, status_line, profiler=None, spec_cache=None, info_cache=None):
     clearScreen()
     print(f"UVC keyboard control — {controller.camera_descriptor.display_name}")
     print("keys: up/down (or k/j, w/s) select, left/right adjust")
@@ -192,10 +192,16 @@ def renderControls(controller, control_ids, selected_idx, step_scales, pair_axis
 
     rows = terminalRows()
     max_visible = max(4, rows - 12)
-    start, end = visibleWindow(selected_idx, len(control_infos), max_visible)
+    start, end = visibleWindow(selected_idx, len(control_ids), max_visible)
 
+    # Only read values for visible controls via USB — not all of them
+    if profiler:
+        profiler.start("render.readValues")
     for idx in range(start, end):
-        control_id, spec, info, value = control_infos[idx]
+        control_id = control_ids[idx]
+        spec = spec_cache[control_id] if spec_cache else controller.getControlSpec(control_id)
+        info = info_cache[control_id] if info_cache else controller.getControlInfo(control_id)
+        value = controller.getControl(control_id)
         selected = idx == selected_idx
         prefix = ">" if selected else " "
         step_size = currentStep(step_scales[control_id], info)
@@ -203,12 +209,15 @@ def renderControls(controller, control_ids, selected_idx, step_scales, pair_axis
         range_text = formatRange(info)
         step_text = formatStep(info, step_size)
         print(f"{prefix} {spec['display']:<20} value={value_text:<18} range={range_text:<24} step={step_text}")
+    if profiler:
+        profiler.stop("render.readValues")
 
-    if start > 0 or end < len(control_infos):
-        print(f"\nshowing {start + 1}-{end} of {len(control_infos)}")
+    if start > 0 or end < len(control_ids):
+        print(f"\nshowing {start + 1}-{end} of {len(control_ids)}")
 
     if value_input is not None:
-        _, spec, _, _ = control_infos[selected_idx]
+        control_id = control_ids[selected_idx]
+        spec = spec_cache[control_id] if spec_cache else controller.getControlSpec(control_id)
         print("")
         print(f"type value for {spec['display']}: {value_input}")
         print("enter apply | esc cancel | backspace edit")
@@ -397,6 +406,11 @@ def runLoop(controller, cv2_index):
     if not control_ids:
         raise UvcControllerError("no supported controls on this camera")
 
+    # Cache specs and info at startup — these don't change at runtime.
+    # This avoids ~5 USB transfers per control per render (was causing 3s lag).
+    spec_cache = {cid: controller.getControlSpec(cid) for cid in control_ids}
+    info_cache = {cid: controller.getControlInfo(cid) for cid in control_ids}
+
     step_scales = {control_id: 1 for control_id in control_ids}
     pair_axis_map = {control_id: 0 for control_id in control_ids}
     selected_idx = 0
@@ -409,7 +423,7 @@ def runLoop(controller, cv2_index):
 
     try:
         with CbreakKeyboard() as keyboard:
-            renderControls(controller, control_ids, selected_idx, step_scales, pair_axis_map, value_input, preview.status, status_line)
+            renderControls(controller, control_ids, selected_idx, step_scales, pair_axis_map, value_input, preview.status, status_line, profiler, spec_cache, info_cache)
 
             while True:
                 profiler.loopStart()
@@ -426,10 +440,8 @@ def runLoop(controller, cv2_index):
                     profiler.loopEnd()
                     continue
 
-                profiler.start("getControlInfo")
                 control_id = control_ids[selected_idx]
-                info = controller.getControlInfo(control_id)
-                profiler.stop("getControlInfo")
+                info = info_cache[control_id]
                 status_line = ""
 
                 if value_input is not None:
@@ -450,7 +462,7 @@ def runLoop(controller, cv2_index):
                         value_input += event
 
                     profiler.start("renderControls")
-                    renderControls(controller, control_ids, selected_idx, step_scales, pair_axis_map, value_input, preview.status, status_line)
+                    renderControls(controller, control_ids, selected_idx, step_scales, pair_axis_map, value_input, preview.status, status_line, profiler, spec_cache, info_cache)
                     profiler.stop("renderControls")
                     profiler.loopEnd()
                     continue
@@ -490,7 +502,7 @@ def runLoop(controller, cv2_index):
                     continue
 
                 profiler.start("renderControls")
-                renderControls(controller, control_ids, selected_idx, step_scales, pair_axis_map, value_input, preview.status, status_line)
+                renderControls(controller, control_ids, selected_idx, step_scales, pair_axis_map, value_input, preview.status, status_line, profiler, spec_cache, info_cache)
                 profiler.stop("renderControls")
 
                 profiler.loopEnd()
