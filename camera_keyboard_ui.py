@@ -1,17 +1,15 @@
 import argparse
 import os
 from datetime import datetime
-import select
 import shutil
 import sys
-import termios
 import time
-import tty
 
 from dotenv import load_dotenv
 load_dotenv()
 
-from camera_preview import PreviewWindow, find_cv2_indices
+from camera_preview import PreviewWindow
+from tui_common import CbreakKeyboard, pickCamera, probeCv2Mapping
 from uvc_camera import UvcCameraController, UvcControllerError, formatCamera, listCameras, unrefCamera
 
 PROFILE_LOG_DIR = os.path.join(os.getcwd(), "logs", "profiling")
@@ -90,11 +88,6 @@ def listOnlyAndExit(cameras):
     return 0
 
 
-def clearScreen():
-    sys.stdout.write("\x1b[2J\x1b[H")
-    sys.stdout.flush()
-
-
 def terminalRows():
     return shutil.get_terminal_size((120, 40)).lines
 
@@ -155,17 +148,6 @@ def formatStep(info, step_size):
     return str(step_size)
 
 
-def renderCameraPicker(cameras, selected_idx):
-    clearScreen()
-    print("Select Camera")
-    print("keys: up/down (or k/j, w/s) to select, enter to open, q to quit")
-    print("")
-    for idx, camera in enumerate(cameras):
-        prefix = ">" if idx == selected_idx else " "
-        print(f"{prefix} {formatCamera(camera, idx)}")
-    sys.stdout.flush()
-
-
 def visibleWindow(selected_idx, total_items, max_visible):
     if total_items <= max_visible:
         return 0, total_items
@@ -180,126 +162,56 @@ def visibleWindow(selected_idx, total_items, max_visible):
 
 
 def renderControls(controller, control_ids, selected_idx, step_scales, pair_axis_map, value_input, preview_status, status_line, profiler=None, spec_cache=None, info_cache=None):
-    clearScreen()
-    print(f"UVC keyboard control — {controller.camera_descriptor.display_name}")
-    print("keys: up/down (or k/j, w/s) select, left/right adjust")
-    print("keys: [ / ] step down/up, a axis for pan/tilt, v type value, c capture, r refresh, b cameras, q quit")
-    if preview_status:
-        print(f"preview: {preview_status}")
-    if status_line:
-        print(f"status: {status_line}")
-    print("")
-
     rows = terminalRows()
     max_visible = max(4, rows - 12)
     start, end = visibleWindow(selected_idx, len(control_ids), max_visible)
 
-    # Only read values for visible controls via USB — not all of them
+    # Read values from USB before touching the screen
     if profiler:
         profiler.start("render.readValues")
+    visible_data = []
     for idx in range(start, end):
         control_id = control_ids[idx]
         spec = spec_cache[control_id] if spec_cache else controller.getControlSpec(control_id)
         info = info_cache[control_id] if info_cache else controller.getControlInfo(control_id)
         value = controller.getControl(control_id)
+        visible_data.append((idx, control_id, spec, info, value))
+    if profiler:
+        profiler.stop("render.readValues")
+
+    # Build entire output in memory, then write all at once (no flicker)
+    lines = []
+    lines.append(f"UVC keyboard control — {controller.camera_descriptor.display_name}")
+    lines.append("keys: up/down (or k/j, w/s) select, left/right adjust")
+    lines.append("keys: [ / ] step down/up, a axis for pan/tilt, v type value, c capture, r refresh, b cameras, q quit")
+    if preview_status:
+        lines.append(f"preview: {preview_status}")
+    if status_line:
+        lines.append(f"status: {status_line}")
+    lines.append("")
+
+    for idx, control_id, spec, info, value in visible_data:
         selected = idx == selected_idx
         prefix = ">" if selected else " "
         step_size = currentStep(step_scales[control_id], info)
         value_text = formatValue(spec, info, value, pair_axis_map[control_id])
         range_text = formatRange(info)
         step_text = formatStep(info, step_size)
-        print(f"{prefix} {spec['display']:<20} value={value_text:<18} range={range_text:<24} step={step_text}")
-    if profiler:
-        profiler.stop("render.readValues")
+        lines.append(f"{prefix} {spec['display']:<20} value={value_text:<18} range={range_text:<24} step={step_text}")
 
     if start > 0 or end < len(control_ids):
-        print(f"\nshowing {start + 1}-{end} of {len(control_ids)}")
+        lines.append(f"\nshowing {start + 1}-{end} of {len(control_ids)}")
 
     if value_input is not None:
         control_id = control_ids[selected_idx]
         spec = spec_cache[control_id] if spec_cache else controller.getControlSpec(control_id)
-        print("")
-        print(f"type value for {spec['display']}: {value_input}")
-        print("enter apply | esc cancel | backspace edit")
+        lines.append("")
+        lines.append(f"type value for {spec['display']}: {value_input}")
+        lines.append("enter apply | esc cancel | backspace edit")
 
+    # Clear screen and write buffer in one shot
+    sys.stdout.write("\x1b[2J\x1b[H" + "\n".join(lines) + "\n")
     sys.stdout.flush()
-
-
-class CbreakKeyboard:
-    def __enter__(self):
-        self._fd = sys.stdin.fileno()
-        self._old = termios.tcgetattr(self._fd)
-        tty.setcbreak(self._fd)
-        self._buffer = ""
-        return self
-
-    def __exit__(self, exc_type, exc, traceback):
-        termios.tcsetattr(self._fd, termios.TCSADRAIN, self._old)
-
-    def readEvent(self, timeout_seconds):
-        if not self._buffer:
-            ready, _, _ = select.select([self._fd], [], [], timeout_seconds)
-            if not ready:
-                return None
-            chunk = os.read(self._fd, 64)
-            if not chunk:
-                return None
-            self._buffer += chunk.decode("latin-1", errors="ignore")
-        else:
-            ready, _, _ = select.select([self._fd], [], [], 0)
-            if ready:
-                chunk = os.read(self._fd, 64)
-                if chunk:
-                    self._buffer += chunk.decode("latin-1", errors="ignore")
-
-        return self._popEvent()
-
-    def _popEvent(self):
-        if not self._buffer:
-            return None
-
-        first_char = self._buffer[0]
-        if first_char != "\x1b":
-            self._buffer = self._buffer[1:]
-            if first_char in ("\r", "\n"):
-                return "enter"
-            if first_char in ("\x7f", "\x08"):
-                return "backspace"
-            return first_char
-
-        if len(self._buffer) == 1:
-            return None
-
-        second_char = self._buffer[1]
-        if second_char not in ("[", "O"):
-            self._buffer = self._buffer[1:]
-            return "esc"
-
-        idx = 2
-        while idx < len(self._buffer):
-            cur = self._buffer[idx]
-            if cur.isalpha() or cur == "~":
-                sequence = self._buffer[: idx + 1]
-                self._buffer = self._buffer[idx + 1 :]
-                last = sequence[-1]
-                if last == "A":
-                    return "up"
-                if last == "B":
-                    return "down"
-                if last == "C":
-                    return "right"
-                if last == "D":
-                    return "left"
-                return "esc"
-            idx += 1
-
-        ready, _, _ = select.select([self._fd], [], [], 0)
-        if ready:
-            chunk = os.read(self._fd, 64)
-            if chunk:
-                self._buffer += chunk.decode("latin-1", errors="ignore")
-                return self._popEvent()
-        return None
 
 
 def clampWithInfo(target_value, info):
@@ -374,29 +286,6 @@ def parseTypedValue(raw_value, spec, info):
         return (first, second)
 
     return int(raw_value)
-
-
-def pickCamera(cameras):
-    if not cameras:
-        return None
-
-    selected_idx = 0
-    with CbreakKeyboard() as keyboard:
-        renderCameraPicker(cameras, selected_idx)
-        while True:
-            event = keyboard.readEvent(0.05)
-            if event is None:
-                continue
-            if event == "q":
-                return None
-            if event in ("up", "k", "w"):
-                selected_idx = (selected_idx - 1) % len(cameras)
-                renderCameraPicker(cameras, selected_idx)
-            elif event in ("down", "j", "s"):
-                selected_idx = (selected_idx + 1) % len(cameras)
-                renderCameraPicker(cameras, selected_idx)
-            elif event == "enter":
-                return selected_idx
 
 
 def runLoop(controller, cv2_index):
@@ -511,23 +400,6 @@ def runLoop(controller, cv2_index):
         preview.stop()
 
     return "quit"
-
-
-def probeCv2Mapping(cameras):
-    """Probe all cameras at once to find their cv2 indices. See camera_preview.py."""
-    controllers = []
-    try:
-        for cam in cameras:
-            ctrl = UvcCameraController(cam)
-            ctrl.open()
-            controllers.append((cam, ctrl))
-        print("detecting preview cameras...")
-        mapping = find_cv2_indices(controllers)
-    finally:
-        for _, ctrl in controllers:
-            ctrl.close()
-    # Convert from id(descriptor) -> cv2_index to list_index -> cv2_index
-    return {i: mapping[id(cam)] for i, cam in enumerate(cameras) if id(cam) in mapping}
 
 
 def main():
